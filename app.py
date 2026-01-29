@@ -11,13 +11,6 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# =========================
-# 前端：漂亮 UI + 兩種加入方式 + 進度顯示
-# 送出流程：
-# 1) POST /start 取得 job_id
-# 2) 前端輪詢 GET /progress/<job_id> 顯示「正在處理第 X/N」
-# 3) 完成後下載 GET /download/<job_id>
-# =========================
 HTML = r"""
 <!doctype html>
 <html>
@@ -53,17 +46,18 @@ HTML = r"""
 <body>
   <div class="wrap">
     <div class="card">
-      <div class="badge">📸 拍照可累積 + 🖼️ 相簿可多選 + ⏱️ 進度顯示</div>
+      <div class="badge">📸 拍照可累積 + 🖼️ 相簿可多選 + ⏱️ 進度顯示 + 🧾 OCR Debug</div>
       <h1>發票拍照 → Excel</h1>
       <p class="sub">
-        ✅ <b>拍照模式</b>：一次拍一張，但可以一直拍（會累積在下面清單）<br>
-        ✅ <b>相簿多選</b>：一次選多張加入清單<br>
-        ✅ 下載 Excel 會包含：<b>invoices（摘要）</b> / <b>items（品項明細）</b><br>
-        ✅ 系統會自動縮圖 + 增強對比（通常更快也更準）
+        ✅ 拍照一次一張，但可以一直加進清單<br>
+        ✅ 相簿可一次多選多張<br>
+        ✅ 進度會顯示「正在處理第 X / N 張…」<br>
+        ✅ Excel 會多一張表 <b>ocr_text</b>（讓你看 OCR 到底讀到什麼）
       </p>
 
       <div class="tips">
-        小提醒：拍照越清楚越準（光線充足、不要歪、不要糊）。不同店家版型差很大，品項欄位解析若怪怪的也正常，之後可以再針對常見版型強化。
+        小提醒：反光/糊/歪都會讓 OCR 讀不到。盡量正、清楚、光線足。<br>
+        如果 invoices 空白，請看 Excel 的 ocr_text 表，就知道 OCR 有沒有讀到關鍵字。
       </div>
 
       <form id="uploadForm">
@@ -118,7 +112,6 @@ HTML = r"""
   const bar = document.getElementById('bar');
   const smallEl = document.getElementById('small');
 
-  // DataTransfer：累積多次拍照/選取
   const dt = new DataTransfer();
 
   function refreshUI() {
@@ -180,7 +173,10 @@ HTML = r"""
   async function pollProgress(jobId) {
     while (true) {
       const res = await fetch(`/progress/${jobId}`);
-      if (!res.ok) throw new Error("讀取進度失敗");
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || "讀取進度失敗");
+      }
       const data = await res.json();
 
       if (data.status === "processing") {
@@ -195,7 +191,6 @@ HTML = r"""
     }
   }
 
-  // 送出：先 /start，拿 job_id，再輪詢，再下載
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
 
@@ -217,28 +212,24 @@ HTML = r"""
       const formData = new FormData();
       for (const f of dt.files) formData.append('photos', f);
 
-      // 1) start
       const startRes = await fetch('/start', { method: 'POST', body: formData });
       if (!startRes.ok) {
         const t = await startRes.text();
-        throw new Error(t || "啟動任務失敗");
+        throw new Error("錯誤：" + t);
       }
       const startData = await startRes.json();
       const jobId = startData.job_id;
 
-      // 2) poll
       submitBtn.textContent = "處理中…";
       await pollProgress(jobId);
 
-      // 3) download
-      const a = document.createElement('a');
-      a.href = `/download/${jobId}`;
-      a.click();
+      // iOS Safari 有時候不喜歡程式 click 下載，改成直接導向下載
+      window.location.href = `/download/${jobId}`;
 
       submitBtn.textContent = oldText;
       submitBtn.disabled = dt.files.length === 0;
     } catch (err) {
-      alert("錯誤：" + err.message);
+      alert(err.message);
       submitBtn.textContent = oldText;
       submitBtn.disabled = dt.files.length === 0;
       statusEl.textContent = "❌ 發生錯誤";
@@ -251,64 +242,45 @@ HTML = r"""
 </html>
 """
 
-# =========================
-# 記憶體中的工作狀態（短時間用，Render free OK）
-# jobs[job_id] = {
-#   status: "processing"|"done"|"error",
-#   current: int,
-#   total: int,
-#   message: str,
-#   error: str,
-#   excel_bytes: bytes,
-#   filename: str
-# }
-# =========================
 jobs = {}
 jobs_lock = threading.Lock()
 
-
-# =========================
-# OCR 前預處理：縮圖 + 對比 + 灰階（加速 & 更穩）
-# - max_width: 最大寬度（太大會慢）
-# - autocontrast + contrast 增強 + 略銳化
-# =========================
 def preprocess_image(img: Image.Image, max_width: int = 1600) -> Image.Image:
-    # 轉成 RGB 避免某些模式出錯
     img = img.convert("RGB")
-
-    # 縮圖（只在太大時縮）
     w, h = img.size
     if w > max_width:
         new_h = int(h * (max_width / w))
         img = img.resize((max_width, new_h), Image.LANCZOS)
 
-    # 灰階
     img = ImageOps.grayscale(img)
-
-    # 自動拉對比（去霧）
     img = ImageOps.autocontrast(img)
+    img = ImageEnhance.Contrast(img).enhance(1.8)
+    img = ImageEnhance.Sharpness(img).enhance(1.3)
 
-    # 再加一點對比
-    img = ImageEnhance.Contrast(img).enhance(1.6)
+    # 二值化（加速 + 更像黑白掃描）
+    threshold = 150
+    img = img.point(lambda x: 255 if x > threshold else 0)
 
     # 輕微銳化
     img = img.filter(ImageFilter.SHARPEN)
-
     return img
 
+def normalize_money(s: str) -> str:
+    return re.sub(r"[^\d]", "", s or "")
 
-# =========================
-# 解析：基本欄位 + 品項表（簡易通用版）
-# 品項抓法：常見 "品名  數量  單價  金額"
-# =========================
 def parse_invoice_text(text: str):
-    invoice_no_m = re.search(r"[A-Z]{2}\d{8}", text)
-    total_m = re.search(r"(總計|合計)\s*([0-9]+)", text)
-    tax_m = re.search(r"稅額\s*([0-9]+)", text)
+    # 允許 AB 12 345678 或 AB-12345678
+    invoice_no_m = re.search(r"([A-Z]{2})\s*[-]?\s*(\d{8})", text)
+    invoice_no = ""
+    if invoice_no_m:
+        invoice_no = invoice_no_m.group(1) + invoice_no_m.group(2)
 
-    invoice_no = invoice_no_m.group() if invoice_no_m else ""
-    total = total_m.group(2) if total_m else ""
-    tax = tax_m.group(1) if tax_m else ""
+    # 金額允許逗號
+    total_m = re.search(r"(總計|合計)\s*[:：]?\s*([0-9,]+)", text)
+    tax_m = re.search(r"稅額\s*[:：]?\s*([0-9,]+)", text)
+
+    total = normalize_money(total_m.group(2)) if total_m else ""
+    tax = normalize_money(tax_m.group(1)) if tax_m else ""
 
     items = []
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -316,13 +288,12 @@ def parse_invoice_text(text: str):
     pat1 = re.compile(r"^(.+?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)$")
     pat2 = re.compile(r"^(.+?)\s+(\d+(?:\.\d+)?)[xX\*](\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)$")
 
-    skip_keywords = ("總計", "合計", "稅額", "小計", "找零", "現金", "信用卡", "電子支付",
-                     "應付", "收款", "折扣", "發票", "統編", "載具", "交易", "日期", "時間")
+    skip_keywords = ("總計","合計","稅額","小計","找零","現金","信用卡","電子支付",
+                     "應付","收款","折扣","發票","統編","載具","交易","日期","時間")
 
     for ln in lines:
         if any(k in ln for k in skip_keywords):
             continue
-
         m = pat2.match(ln) or pat1.match(ln)
         if not m:
             continue
@@ -335,37 +306,26 @@ def parse_invoice_text(text: str):
         if len(name) < 2:
             continue
 
-        items.append({
-            "品項": name,
-            "數量": qty,
-            "單價": unit,
-            "金額": amt
-        })
+        items.append({"品項": name, "數量": qty, "單價": unit, "金額": amt})
 
-    return {
-        "發票號碼": invoice_no,
-        "總金額": total,
-        "稅額": tax,
-        "items": items
-    }
+    return {"發票號碼": invoice_no, "總金額": total, "稅額": tax, "items": items}
 
-
-def build_excel_bytes(invoice_rows, item_rows):
-    df_inv = pd.DataFrame(invoice_rows)
+def build_excel_bytes(inv_rows, item_rows, ocr_rows):
+    df_inv = pd.DataFrame(inv_rows)
     df_items = pd.DataFrame(item_rows)
+    df_ocr = pd.DataFrame(ocr_rows)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_inv.to_excel(writer, sheet_name="invoices", index=False)
         df_items.to_excel(writer, sheet_name="items", index=False)
+        df_ocr.to_excel(writer, sheet_name="ocr_text", index=False)
     output.seek(0)
     return output.getvalue()
 
-
 def worker_process(job_id: str, images_bytes_list):
     total = len(images_bytes_list)
-    invoice_rows = []
-    item_rows = []
+    inv_rows, item_rows, ocr_rows = [], [], []
 
     try:
         for i, img_bytes in enumerate(images_bytes_list, start=1):
@@ -378,10 +338,13 @@ def worker_process(job_id: str, images_bytes_list):
             img = Image.open(io.BytesIO(img_bytes))
             img = preprocess_image(img)
 
-            text = pytesseract.image_to_string(img, lang="chi_tra")
+            # OCR：中+英（發票號碼常需要英文）
+            config = "--oem 3 --psm 6"
+            text = pytesseract.image_to_string(img, lang="chi_tra+eng", config=config)
+
             parsed = parse_invoice_text(text)
 
-            invoice_rows.append({
+            inv_rows.append({
                 "序號": i,
                 "發票號碼": parsed["發票號碼"],
                 "總金額": parsed["總金額"],
@@ -398,10 +361,16 @@ def worker_process(job_id: str, images_bytes_list):
                     "金額": it["金額"],
                 })
 
+            ocr_rows.append({
+                "序號": i,
+                "發票號碼(解析結果)": parsed["發票號碼"],
+                "OCR文字(前2000字)": (text[:2000] if text else "")
+            })
+
         with jobs_lock:
             jobs[job_id]["message"] = "正在產生 Excel…"
 
-        excel_bytes = build_excel_bytes(invoice_rows, item_rows)
+        excel_bytes = build_excel_bytes(inv_rows, item_rows, ocr_rows)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"invoices_{ts}.xlsx"
 
@@ -419,11 +388,9 @@ def worker_process(job_id: str, images_bytes_list):
             jobs[job_id]["error"] = str(e)
             jobs[job_id]["message"] = "❌ 發生錯誤"
 
-
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(HTML)
-
 
 @app.route("/start", methods=["POST"])
 def start():
@@ -431,10 +398,7 @@ def start():
     if not files:
         return "沒有收到檔案（photos），請重新上傳", 400
 
-    # 把檔案讀成 bytes，避免 thread 裡面讀 stream 出問題
-    images_bytes_list = []
-    for f in files:
-        images_bytes_list.append(f.read())
+    images_bytes_list = [f.read() for f in files]
 
     job_id = uuid.uuid4().hex
     with jobs_lock:
@@ -452,7 +416,6 @@ def start():
     t.start()
 
     return jsonify({"job_id": job_id})
-
 
 @app.route("/progress/<job_id>", methods=["GET"])
 def progress(job_id):
@@ -480,7 +443,6 @@ def progress(job_id):
         "message": job.get("message", "")
     })
 
-
 @app.route("/download/<job_id>", methods=["GET"])
 def download(job_id):
     with jobs_lock:
@@ -492,7 +454,6 @@ def download(job_id):
     excel_bytes = job["excel_bytes"]
     filename = job["filename"] or "invoices.xlsx"
 
-    # 下載後把 job 清掉（避免記憶體累積）
     with jobs_lock:
         jobs.pop(job_id, None)
 
@@ -502,7 +463,6 @@ def download(job_id):
         download_name=filename,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
