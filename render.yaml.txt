@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: invoice-ocr
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
